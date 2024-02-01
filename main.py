@@ -5,19 +5,24 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer, HashingVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.linear_model import LogisticRegression
+from sklearn.utils import resample
 from sklearn import svm
 import pandas as pd
-from sklearn.model_selection import cross_validate, KFold
-from sklearn.metrics import make_scorer, precision_score, recall_score, f1_score
+from sklearn.model_selection import KFold
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from tqdm import tqdm
 import time
+import numpy as np
 
 GROUND_TRUTH_PATH = 'data/DBLPTestGroundTruth.txt'
 TRAIN_PATH = 'data/DBLPTrainset.txt'
 TEST_PATH = 'data/DBLPTestset.txt'
 PERFORMANCE_DF_HEADERS = ['Vectorizer', 'Pre-processing', 'Model', 'Total Time', 'Model Time', 'Precision',
-                          'Recall', 'F1 Score']
+                          'Recall', 'F1 Score', 'Confusion Matrix']
 NUMBER_OF_FOLDS = 5
+RANDOM_STATE = 42
+UNDERSAMPLE = True
+OVERSAMPLE = False
 
 
 def load_file(path: str) -> list:
@@ -63,45 +68,112 @@ def pre_process_data(data: list, progress: bool = True) -> tuple:
     return st, lt, ns, stns, ltns, l
 
 
+def calculate_tp_fp_fn_tn_fractions(conf_matrix):
+    total = np.sum(conf_matrix)
+    TP = np.diag(conf_matrix) / total
+    FP = (np.sum(conf_matrix, axis=0) - np.diag(conf_matrix)) / total
+    FN = (np.sum(conf_matrix, axis=1) - np.diag(conf_matrix)) / total
+    TN = total - (FP + FN + np.diag(conf_matrix)) / total
+
+    return TP, FP, FN, TN
+
+
 def train_model(training_data: list, training_labels: list, training_model) -> tuple:
     start_time = time.time()
-    kf = KFold(n_splits=NUMBER_OF_FOLDS, shuffle=True, random_state=42)
+    kf = KFold(n_splits=NUMBER_OF_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
-    # Define the scoring metrics
-    scoring = {
-        'precision': make_scorer(precision_score, average='micro'),
-        'recall': make_scorer(recall_score, average='micro'),
-        'f1_score': make_scorer(f1_score, average='micro')
-    }
+    precision_scores, recall_scores, f1_scores, conf_matrices = [], [], [], []
 
-    # Perform cross validation
-    cv_results = cross_validate(training_model, training_data, training_labels, cv=kf, scoring=scoring)
+    # Ensure training_data is a 2D array or a sparse matrix
+    if isinstance(training_data, list):
+        training_data = np.array(training_data)
+    if isinstance(training_labels, list):
+        training_labels = np.array(training_labels)
 
-    precision, recall, score = cv_results['test_precision'], cv_results['test_recall'], cv_results['test_f1_score']
+    for train_index, test_index in kf.split(training_data):
+        X_train, X_test = training_data[train_index], training_data[test_index]
+        y_train, y_test = training_labels[train_index], training_labels[test_index]
+
+        training_model.fit(X_train, y_train)
+        y_pred = training_model.predict(X_test)
+
+        precision_scores.append(precision_score(y_test, y_pred, average='micro'))
+        recall_scores.append(recall_score(y_test, y_pred, average='micro'))
+        f1_scores.append(f1_score(y_test, y_pred, average='micro'))
+
+        conf_matrices.append(confusion_matrix(y_test, y_pred))
 
     end_time = time.time()
     duration = end_time - start_time
     average_duration = duration / NUMBER_OF_FOLDS
 
-    # training_model.fit(training_data, training_labels)
-    return sum(precision) / NUMBER_OF_FOLDS, sum(recall) / NUMBER_OF_FOLDS, sum(
-        score) / NUMBER_OF_FOLDS, average_duration, duration
+    aggregated_conf_matrix = np.sum(conf_matrices, axis=0)
+
+    return (
+        np.mean(precision_scores),
+        np.mean(recall_scores),
+        np.mean(f1_scores),
+        aggregated_conf_matrix,
+        average_duration,
+        duration
+    )
 
 
-def evaluate_model(evaluating_model, x: list, y: list) -> tuple:
-    start_time = time.time()
-    y_pred = evaluating_model.predict(x)
-    end_time = time.time()
-    duration = end_time - start_time
+def oversample_data(data: list) -> list:
+    # Convert data to DataFrame for easier manipulation
+    df = pd.DataFrame(data, columns=['Category', 'Text'])
 
-    # Calculate the micro averaged precision
-    micro_averaged_precision = precision_score(y, y_pred, average='micro')
-    # Calculate the micro averaged recall
-    micro_averaged_recall = recall_score(y, y_pred, average='micro')
-    # Calculate the f1 score
-    micro_f1_score = f1_score(y, y_pred, average='micro')
+    # Getting the maximum category size to match other categories' size
+    max_size = df['Category'].value_counts().max()
 
-    return micro_averaged_precision, micro_averaged_recall, micro_f1_score, duration
+    # Empty list to hold oversampled data
+    oversampled_data = []
+
+    with tqdm(total=len(df.groupby('Category')), desc="Oversampling data") as pbar:
+        for category, group in df.groupby('Category'):
+            oversampled_group = resample(group,
+                                         replace=True,  # Sample with replacement
+                                         n_samples=max_size,  # Match the majority class
+                                         random_state=RANDOM_STATE)
+            oversampled_data.append(oversampled_group)
+            pbar.update(1)
+
+    # Concatenate the oversampled dataframes
+    oversampled_df = pd.concat(oversampled_data)
+
+    # Convert the DataFrame back to a list of lists
+    oversampled_list = list(oversampled_df.values)
+
+    return oversampled_list
+
+
+def undersample_data(data: list) -> list:
+    # Convert data to DataFrame for easier manipulation
+    df = pd.DataFrame(data, columns=['Category', 'Text'])
+
+    # Getting the minimum category size to match other categories' size
+    min_size = df['Category'].value_counts().min()
+
+    # Empty list to hold undersampled data
+    undersampled_data = []
+
+    with tqdm(total=len(df.groupby('Category')), desc="Undersampling data") as pbar:
+        for category, group in df.groupby('Category'):
+            undersampled_group = resample(group,
+                                          replace=False,
+                                          n_samples=min_size,
+                                          random_state=RANDOM_STATE)
+            undersampled_data.append(undersampled_group)
+            pbar.update(1)
+
+    # Concatenate the undersampled dataframes
+    undersampled_df = pd.concat(undersampled_data)
+
+    # Convert the DataFrame back to a list of lists
+    undersampled_list = list(undersampled_df.values)
+
+    return undersampled_list
+
 
 
 if __name__ == '__main__':
@@ -120,8 +192,13 @@ if __name__ == '__main__':
         train_data.extend(zipped_test_data)
         pbar.update(1)
 
+    if OVERSAMPLE:
+        train_data = oversample_data(train_data)
+    elif UNDERSAMPLE:
+        train_data = undersample_data(train_data)
+
     stemmed_titles, lemmatized_titles, no_stop_words_titles, stemmed_no_stop_words, lemmatized_no_stop_words, labels = \
-        pre_process_data(train_file)
+        pre_process_data(train_data)
 
     # Total number of iterations for the progress bar
     performance_df = pd.DataFrame(columns=PERFORMANCE_DF_HEADERS)
@@ -158,10 +235,13 @@ if __name__ == '__main__':
                 for model_name in models:
                     model = models[model_name]
                     model_micro_averaged_precision, model_micro_averaged_recall, model_micro_f1_score, \
-                        model_average_duration, model_duration = train_model(pre_processing_method, labels, model)
+                    aggregated_conf_matrix, model_average_duration, model_duration = train_model(pre_processing_method,
+                                                                                                 labels,
+                                                                                                 model)
                     new_row = pd.DataFrame([[vectorizer_name, pre_processing_method_name, model_name, model_duration,
                                              model_average_duration, model_micro_averaged_precision,
-                                             model_micro_averaged_recall, model_micro_f1_score]],
+                                             model_micro_averaged_recall, model_micro_f1_score,
+                                             aggregated_conf_matrix]],
                                            columns=PERFORMANCE_DF_HEADERS)
                     # Concatenate the original DataFrame with the new row
                     performance_df = pd.concat([performance_df, new_row], ignore_index=True)
